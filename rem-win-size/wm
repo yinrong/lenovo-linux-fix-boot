@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""
+wm — window-memory 生命周期管理工具
+
+两阶段安全激活流程：
+  1. try_start   → 试运行（重启后自动失效，异常时硬重启即可恢复）
+  2. confirm_start → 确认永久生效（需在 try_start 后重启并确认正常才执行）
+  3. stop        → 停止守护进程并撤销所有自启配置
+
+其他命令：
+  status         → 显示当前运行状态和激活模式
+  save           → 立即保存当前窗口状态
+  restore        → 立即恢复当前 profile 的记忆
+  list           → 列出所有已保存的 profile
+  log            → 查看最近日志（默认 40 行）
+  install-deps   → 安装依赖（wmctrl, python3-dbus, python3-gi）
+
+用法示例：
+  ./wm try_start          # 第一步：试运行
+  # 重启计算机，确认窗口切换正常
+  ./wm confirm_start      # 第二步：永久生效
+  ./wm stop               # 停止并撤销
+"""
+
+import os
+import sys
+import subprocess
+import shutil
+import time
+from pathlib import Path
+
+# ── 路径 ────────────────────────────────────────────────────────────────────
+SCRIPT_DIR     = Path(__file__).parent.resolve()
+DAEMON_SCRIPT  = SCRIPT_DIR / "window-memory.py"
+
+INSTALL_DIR    = Path.home() / ".local" / "bin"
+INSTALLED      = INSTALL_DIR / "window-memory.py"
+
+AUTOSTART_DIR  = Path.home() / ".config" / "autostart"
+# 永久 autostart 文件
+AUTOSTART_PERM = AUTOSTART_DIR / "window-memory.desktop"
+# 试运行 autostart 文件（启动后自删除）
+AUTOSTART_TRY  = AUTOSTART_DIR / "window-memory-try.desktop"
+
+STATE_FILE     = Path.home() / ".config" / "window-memory" / "activation.json"
+LOG_FILE       = Path.home() / ".config" / "window-memory" / "window-memory.log"
+
+
+# ── 工具函数 ─────────────────────────────────────────────────────────────────
+def _run(*cmd, check=False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def _is_running() -> bool:
+    r = _run("pgrep", "-af", "window-memory.py")
+    return r.returncode == 0 and "window-memory.py" in r.stdout
+
+
+def _stop_daemon():
+    r = _run("pkill", "-f", "window-memory.py")
+    if r.returncode == 0:
+        time.sleep(0.5)
+        print("  守护进程已停止")
+    else:
+        print("  守护进程未在运行")
+
+
+def _start_daemon():
+    """后台启动守护进程，继承 DISPLAY/DBUS 等环境变量。"""
+    log = LOG_FILE
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    # 确保 DISPLAY 和 DBUS_SESSION_BUS_ADDRESS 存在
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+
+    with open(log, "a") as f:
+        proc = subprocess.Popen(
+            ["python3", str(INSTALLED), "daemon"],
+            stdout=f, stderr=f,
+            env=env,
+            start_new_session=True,
+        )
+    time.sleep(1.2)
+    if proc.poll() is None:
+        print(f"  守护进程已启动，PID={proc.pid}")
+        return True
+    else:
+        print(f"  错误：守护进程启动后立即退出，请查看日志：{log}")
+        return False
+
+
+def _install_script():
+    """将 window-memory.py 复制到 ~/.local/bin/"""
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DAEMON_SCRIPT, INSTALLED)
+    INSTALLED.chmod(0o755)
+    print(f"  已安装到 {INSTALLED}")
+
+
+def _write_perm_autostart():
+    """写入永久 autostart desktop 文件。"""
+    AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+    content = f"""[Desktop Entry]
+Type=Application
+Name=Window Memory
+Comment=切换显示器时自动保留窗口尺寸和位置
+Exec=python3 {INSTALLED} daemon
+Icon=display
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3
+"""
+    AUTOSTART_PERM.write_text(content)
+    print(f"  已写入永久 autostart: {AUTOSTART_PERM}")
+
+
+def _write_try_autostart():
+    """
+    写入试运行 autostart desktop 文件。
+    启动后执行一个包装脚本：先删除自身，再启动守护进程。
+    这样重启后只运行一次，若有问题再次重启即彻底清除。
+    """
+    AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 包装脚本路径
+    wrapper = Path.home() / ".local" / "bin" / "window-memory-try-once.sh"
+    wrapper_content = f"""#!/bin/bash
+# 试运行包装脚本：执行一次后自删除（重启后不再自启）
+rm -f "{AUTOSTART_TRY}"
+rm -f "$0"
+exec python3 "{INSTALLED}" daemon
+"""
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(wrapper_content)
+    wrapper.chmod(0o755)
+
+    content = f"""[Desktop Entry]
+Type=Application
+Name=Window Memory (Try)
+Comment=window-memory 试运行（重启后自动失效）
+Exec=bash {wrapper}
+Icon=display
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3
+"""
+    AUTOSTART_TRY.write_text(content)
+    print(f"  已写入试运行 autostart: {AUTOSTART_TRY}")
+    print(f"  （重启后自动执行一次，再次重启后自动清除）")
+
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        import json
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_state(data: dict):
+    import json
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _check_deps() -> bool:
+    ok = True
+    for tool in ("wmctrl", "xprop"):
+        if not shutil.which(tool):
+            print(f"  缺少依赖: {tool}")
+            ok = False
+    try:
+        import dbus  # noqa: F401
+    except ImportError:
+        print("  缺少依赖: python3-dbus（将回退到轮询模式）")
+    return ok
+
+
+# ── 命令实现 ─────────────────────────────────────────────────────────────────
+
+def cmd_install_deps():
+    """安装所有依赖。"""
+    print("[install-deps] 安装依赖...")
+    # wmctrl 可能因为 apt 冲突无法直接安装，用手动提取
+    if shutil.which("wmctrl"):
+        print("  wmctrl 已安装")
+    else:
+        print("  正在安装 wmctrl...")
+        r = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "wmctrl"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print("  apt 有冲突，改用手动提取...")
+            tmp = Path("/tmp/wmctrl_extract")
+            tmp.mkdir(exist_ok=True)
+            subprocess.run(
+                ["apt-get", "download", "wmctrl"],
+                cwd=tmp, capture_output=True
+            )
+            debs = list(tmp.glob("wmctrl_*.deb"))
+            if debs:
+                subprocess.run(["dpkg", "-x", str(debs[0]), str(tmp / "pkg")],
+                               capture_output=True)
+                bin_src = tmp / "pkg" / "usr" / "bin" / "wmctrl"
+                if bin_src.exists():
+                    subprocess.run(["sudo", "cp", str(bin_src), "/usr/local/bin/wmctrl"])
+                    print("  wmctrl 手动安装完成")
+            else:
+                print("  错误：无法获取 wmctrl")
+        else:
+            print("  wmctrl 安装完成")
+
+    # python3-dbus 和 python3-gi
+    for pkg in ("python3-dbus", "python3-gi"):
+        r = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", pkg],
+            capture_output=True, text=True
+        )
+        if r.returncode == 0:
+            print(f"  {pkg} 安装完成")
+        else:
+            print(f"  {pkg} 安装失败（可能已存在或有冲突）")
+
+    print("依赖安装完成")
+
+
+def cmd_try_start():
+    """
+    第一步：试运行。
+    - 安装脚本到 ~/.local/bin/
+    - 写入「重启后自动失效」的 autostart 条目
+    - 立即启动守护进程
+    - 记录 activation 状态为 "try"
+    """
+    print("[try_start] 开始试运行...")
+
+    if not DAEMON_SCRIPT.exists():
+        print(f"错误：找不到 {DAEMON_SCRIPT}")
+        sys.exit(1)
+
+    _check_deps()
+    _install_script()
+    _write_try_autostart()
+
+    # 移除可能存在的永久 autostart（避免混淆）
+    if AUTOSTART_PERM.exists():
+        AUTOSTART_PERM.unlink()
+        print(f"  已移除旧的永久 autostart: {AUTOSTART_PERM}")
+
+    _stop_daemon()
+    ok = _start_daemon()
+
+    _save_state({
+        "mode": "try",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "started": ok,
+    })
+
+    print()
+    print("═" * 58)
+    print(" 试运行已启动！")
+    print()
+    print(" 下一步：")
+    print("   1. 测试切换显示器，确认窗口尺寸正常")
+    print("   2. 重启计算机（试运行 autostart 将自动执行一次）")
+    print("   3. 重启后再次测试，确认功能正常")
+    print("   4. 满意后执行：./wm confirm_start  （永久生效）")
+    print()
+    print(" 如有问题：再次重启即自动清除，无需手动操作")
+    print("═" * 58)
+
+
+def cmd_confirm_start():
+    """
+    第二步：确认永久生效。
+    - 写入永久 autostart 条目
+    - 清理试运行的临时文件
+    - 记录 activation 状态为 "permanent"
+    """
+    state = _load_state()
+    if state.get("mode") not in ("try", "permanent"):
+        print("警告：未检测到 try_start 记录，建议先执行 ./wm try_start")
+        ans = input("是否仍要继续？(y/N) ").strip().lower()
+        if ans != "y":
+            print("已取消")
+            return
+
+    print("[confirm_start] 写入永久配置...")
+
+    _install_script()  # 确保最新版本
+    _write_perm_autostart()
+
+    # 清理试运行临时文件
+    wrapper = Path.home() / ".local" / "bin" / "window-memory-try-once.sh"
+    for f in [AUTOSTART_TRY, wrapper]:
+        if f.exists():
+            f.unlink()
+            print(f"  已清理临时文件: {f}")
+
+    # 确保守护进程在运行
+    if not _is_running():
+        print("  守护进程未运行，正在启动...")
+        _start_daemon()
+    else:
+        print("  守护进程已在运行")
+
+    _save_state({
+        "mode": "permanent",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+    print()
+    print("═" * 58)
+    print(" 已永久生效！每次登录后将自动启动。")
+    print("═" * 58)
+
+
+def cmd_stop():
+    """停止守护进程并撤销所有自启配置。"""
+    print("[stop] 停止 window-memory...")
+
+    _stop_daemon()
+
+    removed = []
+    for f in [AUTOSTART_PERM, AUTOSTART_TRY]:
+        if f.exists():
+            f.unlink()
+            removed.append(str(f))
+
+    wrapper = Path.home() / ".local" / "bin" / "window-memory-try-once.sh"
+    if wrapper.exists():
+        wrapper.unlink()
+        removed.append(str(wrapper))
+
+    if removed:
+        for r in removed:
+            print(f"  已删除: {r}")
+    else:
+        print("  无 autostart 条目需要清理")
+
+    _save_state({"mode": "stopped", "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+    print()
+    print("═" * 58)
+    print(" 已停止。profile 数据保留在：")
+    print(f"   {Path.home()}/.config/window-memory/profiles.json")
+    print(" 如需彻底清除数据：rm -rf ~/.config/window-memory/")
+    print("═" * 58)
+
+
+def cmd_status():
+    """显示当前状态。"""
+    state = _load_state()
+    mode = state.get("mode", "unknown")
+    since = state.get("time", "")
+
+    running = _is_running()
+    perm_ok = AUTOSTART_PERM.exists()
+    try_ok  = AUTOSTART_TRY.exists()
+
+    print("── window-memory 状态 ──────────────────────────────")
+    print(f"  激活模式 : {mode}  (记录于 {since})")
+    print(f"  守护进程 : {'✓ 运行中' if running else '✗ 未运行'}")
+    print(f"  永久自启 : {'✓ 已设置' if perm_ok else '✗ 未设置'}  ({AUTOSTART_PERM})")
+    print(f"  试运行   : {'✓ 已设置（重启后执行一次）' if try_ok else '✗ 未设置'}  ({AUTOSTART_TRY})")
+    print(f"  日志     : {LOG_FILE}")
+    print()
+
+    # 显示当前 profile
+    r = _run("python3", str(INSTALLED), "list") if INSTALLED.exists() else None
+    if r and r.returncode == 0 and r.stdout.strip():
+        print("── 已记忆的 profile ────────────────────────────────")
+        print(r.stdout)
+    else:
+        print("  （无已保存的 profile）")
+
+
+def cmd_save():
+    if not INSTALLED.exists():
+        print("错误：尚未安装，请先执行 ./wm try_start")
+        sys.exit(1)
+    subprocess.run(["python3", str(INSTALLED), "save"])
+
+
+def cmd_restore():
+    if not INSTALLED.exists():
+        print("错误：尚未安装，请先执行 ./wm try_start")
+        sys.exit(1)
+    subprocess.run(["python3", str(INSTALLED), "restore"])
+
+
+def cmd_list():
+    if not INSTALLED.exists():
+        print("错误：尚未安装，请先执行 ./wm try_start")
+        sys.exit(1)
+    subprocess.run(["python3", str(INSTALLED), "list"])
+
+
+def cmd_log(n: int = 40):
+    if LOG_FILE.exists():
+        lines = LOG_FILE.read_text().splitlines()
+        for line in lines[-n:]:
+            print(line)
+    else:
+        print("日志文件不存在")
+
+
+# ── 入口 ─────────────────────────────────────────────────────────────────────
+COMMANDS = {
+    "try_start":     cmd_try_start,
+    "confirm_start": cmd_confirm_start,
+    "stop":          cmd_stop,
+    "status":        cmd_status,
+    "save":          cmd_save,
+    "restore":       cmd_restore,
+    "list":          cmd_list,
+    "install-deps":  cmd_install_deps,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        print("可用命令:", ", ".join(COMMANDS))
+        return
+
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print(f"未知命令: {cmd}")
+        print("可用命令:", ", ".join(COMMANDS))
+        sys.exit(1)
+
+    if cmd == "log":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 40
+        cmd_log(n)
+    else:
+        COMMANDS[cmd]()
+
+
+if __name__ == "__main__":
+    main()
