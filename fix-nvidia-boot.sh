@@ -173,14 +173,42 @@ echo "[5/5] 重载 systemd 并启用服务..."
 systemctl daemon-reload
 systemctl enable nvidia-boot-cleanup.service
 
-# 若此次开机就是断电恢复场景，主动创建 flag 并立即执行修复
-# （检测方法：上次 boot 的最后一条 journal 是否包含 nvidia-suspend）
-if journalctl -b -1 --no-pager 2>/dev/null | tail -20 | grep -q "nvidia-suspend\|suspend entry"; then
-    echo ""
-    echo "    检测到上次启动以 suspend 结束，立即创建 flag 并执行修复..."
-    touch /var/lib/nvidia-boot-cleanup/suspend-pending
-    systemctl start nvidia-boot-cleanup.service || true
+# 立即执行一次修复（无论是否检测到 flag）
+# 原因：脚本首次安装时，历史上的断电发生在 drop-in 安装之前，flag 不存在
+# 直接重载模块是最可靠的方式，在 recovery mode 和正常 session 下均有效
+echo ""
+echo "    立即执行 nvidia_drm + nvidia_modeset 模块重载..."
+if [ -f /proc/driver/nvidia/version ]; then
+    _reload_ok=1
+    if lsmod | grep -q "^nvidia_drm "; then
+        if rmmod nvidia_drm 2>/dev/null; then
+            echo "    卸载 nvidia_drm: OK"
+        else
+            echo "    WARNING: nvidia_drm 正在被使用，跳过重载（请在 recovery mode 下运行本脚本）"
+            _reload_ok=0
+        fi
+    fi
+    if [ "$_reload_ok" = "1" ] && lsmod | grep -q "^nvidia_modeset "; then
+        if rmmod nvidia_modeset 2>/dev/null; then
+            echo "    卸载 nvidia_modeset: OK"
+        else
+            echo "    WARNING: nvidia_modeset 卸载失败，尝试重新加载 nvidia_drm..."
+            modprobe nvidia_drm modeset=1 2>/dev/null || true
+            _reload_ok=0
+        fi
+    fi
+    if [ "$_reload_ok" = "1" ]; then
+        modprobe nvidia_modeset 2>/dev/null && echo "    加载 nvidia_modeset: OK"
+        modprobe nvidia_drm modeset=1 2>/dev/null && echo "    加载 nvidia_drm modeset=1: OK"
+        echo "    模块重载完成，NVKMS 状态已清除"
+    fi
+else
+    echo "    nvidia 模块未加载（可能是旧内核），跳过模块重载"
+    echo "    下次用新内核启动时，若 flag 文件存在则自动执行"
 fi
+
+# 同时创建 flag，确保下次启动也执行（以防本次重载不够）
+touch /var/lib/nvidia-boot-cleanup/suspend-pending
 
 echo ""
 echo "✓ 安装完成。"
