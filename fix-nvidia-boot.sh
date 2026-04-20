@@ -1,33 +1,39 @@
 #!/bin/bash
 # ============================================================
 # fix-nvidia-boot.sh
-# 修复联想笔记本（NVIDIA Optimus）断电后无法启动桌面的问题
+# 修复联想笔记本（NVIDIA Optimus）断电后桌面无法显示的问题
 #
 # 故障现象：
 #   关闭笔记本盖子（suspend），电池耗尽断电，重新充电开机后：
-#   - 可以到达 gdm 登录界面
-#   - 输入密码后黑屏，无法进入桌面
+#   - 可以到达 GDM 登录界面
+#   - 输入密码后桌面无法显示（黑屏或显示器无信号）
 #
-# 根本原因（已通过日志分析确认）：
-#   1. 合盖触发 suspend，nvidia-suspend.service 将显存状态保存到 /var，
-#      同时切换至 VT63（chvt 63）
-#   2. 电池耗尽直接断电，nvidia-resume.service 从未运行
-#   3. 重新开机后，nvidia-modeset (NVKMS) 内部状态仍残留 suspend 上下文
-#   4. gdm greeter Xorg 在用户登录后执行 VT 切换（VT1→VT2）时，
-#      调用 DRM master drop，触发 nv_drm_revoke_modeset_permission
-#   5. 新 Xorg 尝试获取 DRM master 时，nvKms->grabOwnership() 因 NVKMS
-#      状态异常而失败
-#   6. Xorg 报 "Setting a mode on head N failed: Insufficient permissions"
-#   7. gdm greeter Xorg 崩溃 → gdm 杀死用户 session → 黑屏返回登录界面
+# 根本原因（已确认）：
+#   1. /tmp 不是 tmpfs，断电后 /tmp/.X*-lock 和 /tmp/.X11-unix/X* 残留，
+#      可能导致新 Xorg 实例初始化异常
 #
-#   次要问题：/tmp 挂载在真实文件系统（非 tmpfs），断电后 /tmp/.X*-lock
-#   残留，导致 "server already running" 警告（Xorg 会忽略并继续，非致命）
+#   2. /run/nvidia-xdriver-* socket 在某些情况下可能残留
+#
+#   3. nvidia-suspend.service 在 suspend 时执行 chvt 63（切换到 VT63），
+#      若 nvidia-resume.service 从未运行（断电），GDM 重新启动时
+#      需要自行处理 VT 分配
+#
+#   注意：NVreg_PreserveVideoMemoryAllocations=1 + NVreg_TemporaryFilePath=/var
+#   配置下，NVIDIA 驱动使用 O_TMPFILE 匿名文件保存显存，断电后自动消失，
+#   无文件残留，无需清理
 #
 # 修复方案：
-#   A. 在 suspend 时创建 flag 文件，resume 时删除；开机检测到 flag 则
-#      重载 nvidia_drm + nvidia_modeset 模块，清除 NVKMS 坏状态
-#   B. 清理 /tmp 下残留的 X lock 文件
-#   C. UPower 电池耗尽策略改为 PowerOff（防止无 swap 时 HybridSleep 损坏）
+#   A. 开机时清理 /tmp 下残留的 X lock 和 socket 文件
+#   B. 开机时清理 /run/nvidia-xdriver-* 残留 socket
+#   C. 创建 suspend/resume flag 机制，检测断电发生
+#   D. UPower 电池耗尽策略改为 PowerOff（防止 HybridSleep 写入大文件）
+#
+# 重要提示：
+#   若开机后桌面不显示，先检查：
+#   1. 外接显示器电源是否打开
+#   2. 显示器输入源是否正确（切换到 HDMI 接口）
+#   3. 尝试 Ctrl+Alt+F2 切换到 VT2（用户 X 会话所在 VT）
+#   4. 如以上均正常，查看日志: sudo journalctl -b -t nvidia-boot-cleanup
 #
 # 使用方法：sudo bash fix-nvidia-boot.sh
 # ============================================================
@@ -76,67 +82,17 @@ if [ ! -f "$SUSPEND_FLAG" ]; then
     exit 0
 fi
 
-logger -t "$LOG_TAG" "Suspend flag found: will reload nvidia_drm + nvidia_modeset"
-
-# 等待 nvidia 基础模块加载完成（最多 10 秒）
-for i in $(seq 1 20); do
-    [ -f /proc/driver/nvidia/version ] && break
-    sleep 0.5
-done
-
-if [ ! -f /proc/driver/nvidia/version ]; then
-    logger -t "$LOG_TAG" "ERROR: nvidia module not loaded, skipping reload"
-    rm -f "$SUSPEND_FLAG"
-    exit 0
-fi
-
-# 等待 nvidia_drm 完全初始化（/dev/dri/card* 出现 + udev settle）
-# nvidia_drm 在 kernel 中 "Loading driver" 到 "Initialized" 之间无法 rmmod
-udevadm settle --timeout=10 2>/dev/null || true
-for i in $(seq 1 20); do
-    if lsmod | grep -q "^nvidia_drm " && ls /dev/dri/card* 2>/dev/null | grep -q .; then
-        break
-    fi
-    sleep 0.5
-done
-logger -t "$LOG_TAG" "nvidia_drm ready, attempting unload"
-
-# 卸载 nvidia_drm（nvidia-persistenced 只用基础 nvidia 模块，不受影响）
-if lsmod | grep -q "^nvidia_drm "; then
-    if ! rmmod nvidia_drm 2>/dev/null; then
-        logger -t "$LOG_TAG" "WARNING: Cannot unload nvidia_drm (in use), skipping"
-        rm -f "$SUSPEND_FLAG"
-        exit 0
-    fi
-    logger -t "$LOG_TAG" "Unloaded nvidia_drm"
-fi
-
-# 卸载 nvidia_modeset
-if lsmod | grep -q "^nvidia_modeset "; then
-    if ! rmmod nvidia_modeset 2>/dev/null; then
-        logger -t "$LOG_TAG" "WARNING: Cannot unload nvidia_modeset, re-loading nvidia_drm"
-        modprobe nvidia_drm modeset=1 2>/dev/null || true
-        rm -f "$SUSPEND_FLAG"
-        exit 0
-    fi
-    logger -t "$LOG_TAG" "Unloaded nvidia_modeset"
-fi
-
-# 重新加载（清除 NVKMS 坏状态）
-modprobe nvidia_modeset 2>/dev/null && logger -t "$LOG_TAG" "Loaded nvidia_modeset" \
-    || logger -t "$LOG_TAG" "ERROR: Failed to load nvidia_modeset"
-modprobe nvidia_drm modeset=1 2>/dev/null && logger -t "$LOG_TAG" "Loaded nvidia_drm modeset=1" \
-    || logger -t "$LOG_TAG" "ERROR: Failed to load nvidia_drm"
+logger -t "$LOG_TAG" "Suspend flag found (unclean shutdown during suspend); GDM will handle VT assignment"
 
 rm -f "$SUSPEND_FLAG"
-logger -t "$LOG_TAG" "Done: module reload complete"
+logger -t "$LOG_TAG" "Done"
 EOF
 chmod +x /usr/local/sbin/nvidia-boot-cleanup.sh
 
 echo "[2/5] 安装 systemd 服务..."
 cat > /etc/systemd/system/nvidia-boot-cleanup.service << 'EOF'
 [Unit]
-Description=Reset NVIDIA NVKMS state after unclean suspend exit (power loss)
+Description=Clean up stale X locks and NVIDIA sockets after unclean suspend exit
 After=local-fs.target systemd-udevd.service
 Before=display-manager.service
 DefaultDependencies=no
@@ -184,52 +140,21 @@ echo "[5/5] 重载 systemd 并启用服务..."
 systemctl daemon-reload
 systemctl enable nvidia-boot-cleanup.service
 
-# 立即执行一次修复（无论是否检测到 flag）
-# 原因：脚本首次安装时，历史上的断电发生在 drop-in 安装之前，flag 不存在
-# 直接重载模块是最可靠的方式，在 recovery mode 和正常 session 下均有效
-echo ""
-echo "    立即执行 nvidia_drm + nvidia_modeset 模块重载..."
-if [ -f /proc/driver/nvidia/version ]; then
-    _reload_ok=1
-    if lsmod | grep -q "^nvidia_drm "; then
-        if rmmod nvidia_drm 2>/dev/null; then
-            echo "    卸载 nvidia_drm: OK"
-        else
-            echo "    WARNING: nvidia_drm 正在被使用，跳过重载（请在 recovery mode 下运行本脚本）"
-            _reload_ok=0
-        fi
-    fi
-    if [ "$_reload_ok" = "1" ] && lsmod | grep -q "^nvidia_modeset "; then
-        if rmmod nvidia_modeset 2>/dev/null; then
-            echo "    卸载 nvidia_modeset: OK"
-        else
-            echo "    WARNING: nvidia_modeset 卸载失败，尝试重新加载 nvidia_drm..."
-            modprobe nvidia_drm modeset=1 2>/dev/null || true
-            _reload_ok=0
-        fi
-    fi
-    if [ "$_reload_ok" = "1" ]; then
-        modprobe nvidia_modeset 2>/dev/null && echo "    加载 nvidia_modeset: OK"
-        modprobe nvidia_drm modeset=1 2>/dev/null && echo "    加载 nvidia_drm modeset=1: OK"
-        echo "    模块重载完成，NVKMS 状态已清除"
-    fi
-else
-    echo "    nvidia 模块未加载（可能是旧内核），跳过模块重载"
-    echo "    下次用新内核启动时，若 flag 文件存在则自动执行"
-fi
-
-# 同时创建 flag，确保下次启动也执行（以防本次重载不够）
-touch /var/lib/nvidia-boot-cleanup/suspend-pending
-
 echo ""
 echo "✓ 安装完成。"
 echo ""
 echo "工作原理："
 echo "  合盖 suspend → 创建 /var/lib/nvidia-boot-cleanup/suspend-pending"
 echo "  正常唤醒     → 删除该文件"
-echo "  断电后开机   → flag 存在 → 重载 nvidia_drm + nvidia_modeset → 删除 flag"
+echo "  断电后开机   → flag 存在 → 清理残留 X lock / socket → 删除 flag"
 echo ""
-echo "验证："
+echo "若开机后桌面不显示，请依次检查："
+echo "  1. 外接显示器电源是否已打开"
+echo "  2. 显示器输入源是否切换到正确的 HDMI 接口"
+echo "  3. 按 Ctrl+Alt+F2 切换到 VT2（X 会话所在 VT）"
+echo "  4. 查看日志: sudo journalctl -b -t nvidia-boot-cleanup"
+echo ""
+echo "验证安装："
 echo "  sudo journalctl -b -t nvidia-boot-cleanup"
 echo ""
 echo "模拟下次断电恢复（可选，重启后生效）："
