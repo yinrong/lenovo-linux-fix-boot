@@ -78,8 +78,8 @@ fi
 
 logger -t "$LOG_TAG" "Suspend flag found: will reload nvidia_drm + nvidia_modeset"
 
-# 等待 nvidia 基础模块加载完成（最多 5 秒）
-for i in $(seq 1 10); do
+# 等待 nvidia 基础模块加载完成（最多 10 秒）
+for i in $(seq 1 20); do
     [ -f /proc/driver/nvidia/version ] && break
     sleep 0.5
 done
@@ -89,6 +89,17 @@ if [ ! -f /proc/driver/nvidia/version ]; then
     rm -f "$SUSPEND_FLAG"
     exit 0
 fi
+
+# 等待 nvidia_drm 完全初始化（/dev/dri/card* 出现 + udev settle）
+# nvidia_drm 在 kernel 中 "Loading driver" 到 "Initialized" 之间无法 rmmod
+udevadm settle --timeout=10 2>/dev/null || true
+for i in $(seq 1 20); do
+    if lsmod | grep -q "^nvidia_drm " && ls /dev/dri/card* 2>/dev/null | grep -q .; then
+        break
+    fi
+    sleep 0.5
+done
+logger -t "$LOG_TAG" "nvidia_drm ready, attempting unload"
 
 # 卸载 nvidia_drm（nvidia-persistenced 只用基础 nvidia 模块，不受影响）
 if lsmod | grep -q "^nvidia_drm "; then
