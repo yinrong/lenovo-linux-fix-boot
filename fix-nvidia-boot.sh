@@ -4,21 +4,30 @@
 # 修复联想笔记本（NVIDIA Optimus）断电后无法启动桌面的问题
 #
 # 故障现象：
-#   电池耗尽断电后重启，6.14.0-34 内核下 gdm 无法启动
-#   Xorg 日志报：
-#     (EE) open /dev/fb0: Permission denied
-#     (WW) NVIDIA: Failed to bind sideband socket '/var/run/nvidia-xdriver-XXXX': Permission denied
-#     (WW) NVIDIA(G0): Setting a mode on head N failed: Insufficient permissions
+#   关闭笔记本盖子（suspend），电池耗尽断电，重新充电开机后：
+#   - 可以到达 gdm 登录界面
+#   - 输入密码后黑屏，无法进入桌面
 #
-# 根本原因：
-#   1. NVIDIA 驱动配置了 NVreg_PreserveVideoMemoryAllocations=1
-#   2. 正常 suspend 后电池耗尽直接断电（而非正常恢复）
-#   3. /proc/driver/nvidia/suspend 状态未被重置
-#   4. 导致下次启动时 NVIDIA 驱动拒绝 gdm(uid=120) 的显示权限请求
+# 根本原因（已通过日志分析确认）：
+#   1. 合盖触发 suspend，nvidia-suspend.service 将显存状态保存到 /var，
+#      同时切换至 VT63（chvt 63）
+#   2. 电池耗尽直接断电，nvidia-resume.service 从未运行
+#   3. 重新开机后，nvidia-modeset (NVKMS) 内部状态仍残留 suspend 上下文
+#   4. gdm greeter Xorg 在用户登录后执行 VT 切换（VT1→VT2）时，
+#      调用 DRM master drop，触发 nv_drm_revoke_modeset_permission
+#   5. 新 Xorg 尝试获取 DRM master 时，nvKms->grabOwnership() 因 NVKMS
+#      状态异常而失败
+#   6. Xorg 报 "Setting a mode on head N failed: Insufficient permissions"
+#   7. gdm greeter Xorg 崩溃 → gdm 杀死用户 session → 黑屏返回登录界面
+#
+#   次要问题：/tmp 挂载在真实文件系统（非 tmpfs），断电后 /tmp/.X*-lock
+#   残留，导致 "server already running" 警告（Xorg 会忽略并继续，非致命）
 #
 # 修复方案：
-#   A. systemd 服务：每次启动时清理 NVIDIA 残留状态（治本）
-#   B. UPower 配置：电池耗尽时 PowerOff 代替 HybridSleep（无 swap 时 HybridSleep 有害）
+#   A. 在 suspend 时创建 flag 文件，resume 时删除；开机检测到 flag 则
+#      重载 nvidia_drm + nvidia_modeset 模块，清除 NVKMS 坏状态
+#   B. 清理 /tmp 下残留的 X lock 文件
+#   C. UPower 电池耗尽策略改为 PowerOff（防止无 swap 时 HybridSleep 损坏）
 #
 # 使用方法：sudo bash fix-nvidia-boot.sh
 # ============================================================
@@ -30,44 +39,94 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Recovery mode 下根文件系统通常是只读的，自动重挂载为读写
 if ! touch /tmp/.rw_test 2>/dev/null; then
-    echo "[0/4] 根文件系统只读，正在重挂载为读写..."
+    echo "[0/5] 根文件系统只读，正在重挂载为读写..."
     mount -o remount,rw /
     echo "    已重挂载 / 为读写"
 else
     rm -f /tmp/.rw_test
 fi
 
-echo "[1/4] 安装 NVIDIA 启动清理脚本..."
+mkdir -p /var/lib/nvidia-boot-cleanup
+
+echo "[1/5] 安装 NVIDIA 启动清理脚本..."
 cat > /usr/local/sbin/nvidia-boot-cleanup.sh << 'EOF'
 #!/bin/bash
-# 清理 NVIDIA 断电后的残留状态
+SUSPEND_FLAG="/var/lib/nvidia-boot-cleanup/suspend-pending"
+LOG_TAG="nvidia-boot-cleanup"
+
+logger -t "$LOG_TAG" "Starting"
+
+# 清理 /tmp 下残留的 X lock 文件（/tmp 不是 tmpfs，断电后残留）
+for lockfile in /tmp/.X[0-9]*-lock; do
+    [ -f "$lockfile" ] || continue
+    pid=$(tr -d ' \n' < "$lockfile" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        display=$(echo "$lockfile" | grep -oE 'X[0-9]+' | head -1)
+        rm -f "$lockfile" "/tmp/.X11-unix/${display}" 2>/dev/null || true
+        logger -t "$LOG_TAG" "Removed stale X lock: $lockfile (dead pid $pid)"
+    fi
+done
 
 # 清理 nvidia-xdriver socket 残留
-find /var/run /run -maxdepth 2 -name "nvidia-xdriver-*" -type s -delete 2>/dev/null
-find /var/run /run -maxdepth 2 -name "nvidia-xdriver-*" -delete 2>/dev/null
+find /var/run /run -maxdepth 2 -name "nvidia-xdriver-*" -delete 2>/dev/null || true
 
-# 重置 NVIDIA suspend 状态
-if [ -w /proc/driver/nvidia/suspend ]; then
-    CURRENT=$(cat /proc/driver/nvidia/suspend 2>/dev/null)
-    if [ "$CURRENT" = "suspended" ] || [ "$CURRENT" = "hibernated" ]; then
-        echo "resume" > /proc/driver/nvidia/suspend 2>/dev/null || true
-    fi
+if [ ! -f "$SUSPEND_FLAG" ]; then
+    logger -t "$LOG_TAG" "No suspend flag, done"
+    exit 0
 fi
 
-# 清理 nvidia-sleep 临时文件
-rm -f /var/run/nvidia-sleep/Xorg.vt_number 2>/dev/null
+logger -t "$LOG_TAG" "Suspend flag found: will reload nvidia_drm + nvidia_modeset"
 
-exit 0
+# 等待 nvidia 基础模块加载完成（最多 5 秒）
+for i in $(seq 1 10); do
+    [ -f /proc/driver/nvidia/version ] && break
+    sleep 0.5
+done
+
+if [ ! -f /proc/driver/nvidia/version ]; then
+    logger -t "$LOG_TAG" "ERROR: nvidia module not loaded, skipping reload"
+    rm -f "$SUSPEND_FLAG"
+    exit 0
+fi
+
+# 卸载 nvidia_drm（nvidia-persistenced 只用基础 nvidia 模块，不受影响）
+if lsmod | grep -q "^nvidia_drm "; then
+    if ! rmmod nvidia_drm 2>/dev/null; then
+        logger -t "$LOG_TAG" "WARNING: Cannot unload nvidia_drm (in use), skipping"
+        rm -f "$SUSPEND_FLAG"
+        exit 0
+    fi
+    logger -t "$LOG_TAG" "Unloaded nvidia_drm"
+fi
+
+# 卸载 nvidia_modeset
+if lsmod | grep -q "^nvidia_modeset "; then
+    if ! rmmod nvidia_modeset 2>/dev/null; then
+        logger -t "$LOG_TAG" "WARNING: Cannot unload nvidia_modeset, re-loading nvidia_drm"
+        modprobe nvidia_drm modeset=1 2>/dev/null || true
+        rm -f "$SUSPEND_FLAG"
+        exit 0
+    fi
+    logger -t "$LOG_TAG" "Unloaded nvidia_modeset"
+fi
+
+# 重新加载（清除 NVKMS 坏状态）
+modprobe nvidia_modeset 2>/dev/null && logger -t "$LOG_TAG" "Loaded nvidia_modeset" \
+    || logger -t "$LOG_TAG" "ERROR: Failed to load nvidia_modeset"
+modprobe nvidia_drm modeset=1 2>/dev/null && logger -t "$LOG_TAG" "Loaded nvidia_drm modeset=1" \
+    || logger -t "$LOG_TAG" "ERROR: Failed to load nvidia_drm"
+
+rm -f "$SUSPEND_FLAG"
+logger -t "$LOG_TAG" "Done: module reload complete"
 EOF
 chmod +x /usr/local/sbin/nvidia-boot-cleanup.sh
 
-echo "[2/4] 安装 systemd 服务..."
+echo "[2/5] 安装 systemd 服务..."
 cat > /etc/systemd/system/nvidia-boot-cleanup.service << 'EOF'
 [Unit]
-Description=Clean up stale NVIDIA xdriver sockets and reset suspend state after power loss
-After=local-fs.target
+Description=Reset NVIDIA NVKMS state after unclean suspend exit (power loss)
+After=local-fs.target systemd-udevd.service
 Before=display-manager.service
 DefaultDependencies=no
 
@@ -76,28 +135,63 @@ Type=oneshot
 ExecStart=/usr/local/sbin/nvidia-boot-cleanup.sh
 RemainAfterExit=yes
 StandardOutput=journal
+TimeoutStartSec=30
 
 [Install]
 WantedBy=display-manager.service
 EOF
 
-systemctl daemon-reload
-systemctl enable nvidia-boot-cleanup.service
-echo "    已启用 nvidia-boot-cleanup.service"
+echo "[3/5] 安装 suspend/resume flag drop-in..."
 
-echo "[3/4] 修改 UPower 电池耗尽策略 (HybridSleep -> PowerOff)..."
-if grep -q "CriticalPowerAction=HybridSleep" /etc/UPower/UPower.conf; then
+mkdir -p /etc/systemd/system/nvidia-suspend.service.d
+cat > /etc/systemd/system/nvidia-suspend.service.d/set-flag.conf << 'EOF'
+[Service]
+ExecStartPost=/bin/sh -c 'mkdir -p /var/lib/nvidia-boot-cleanup && touch /var/lib/nvidia-boot-cleanup/suspend-pending'
+EOF
+
+mkdir -p /etc/systemd/system/nvidia-hibernate.service.d
+cat > /etc/systemd/system/nvidia-hibernate.service.d/set-flag.conf << 'EOF'
+[Service]
+ExecStartPost=/bin/sh -c 'mkdir -p /var/lib/nvidia-boot-cleanup && touch /var/lib/nvidia-boot-cleanup/suspend-pending'
+EOF
+
+mkdir -p /etc/systemd/system/nvidia-resume.service.d
+cat > /etc/systemd/system/nvidia-resume.service.d/clear-flag.conf << 'EOF'
+[Service]
+ExecStartPost=/bin/rm -f /var/lib/nvidia-boot-cleanup/suspend-pending
+EOF
+
+echo "[4/5] 修改 UPower 电池耗尽策略 (HybridSleep -> PowerOff)..."
+if grep -q "CriticalPowerAction=HybridSleep" /etc/UPower/UPower.conf 2>/dev/null; then
     sed -i 's/CriticalPowerAction=HybridSleep/CriticalPowerAction=PowerOff/' /etc/UPower/UPower.conf
     echo "    已修改 CriticalPowerAction=PowerOff"
 else
-    echo "    已是 PowerOff 或不需要修改: $(grep CriticalPowerAction /etc/UPower/UPower.conf)"
+    echo "    当前配置: $(grep CriticalPowerAction /etc/UPower/UPower.conf 2>/dev/null || echo '未找到')"
 fi
 
-echo "[4/4] 验证..."
-systemctl start nvidia-boot-cleanup.service
-STATUS=$(systemctl is-active nvidia-boot-cleanup.service)
-echo "    nvidia-boot-cleanup.service 状态: $STATUS"
+echo "[5/5] 重载 systemd 并启用服务..."
+systemctl daemon-reload
+systemctl enable nvidia-boot-cleanup.service
+
+# 若此次开机就是断电恢复场景，主动创建 flag 并立即执行修复
+# （检测方法：上次 boot 的最后一条 journal 是否包含 nvidia-suspend）
+if journalctl -b -1 --no-pager 2>/dev/null | tail -20 | grep -q "nvidia-suspend\|suspend entry"; then
+    echo ""
+    echo "    检测到上次启动以 suspend 结束，立即创建 flag 并执行修复..."
+    touch /var/lib/nvidia-boot-cleanup/suspend-pending
+    systemctl start nvidia-boot-cleanup.service || true
+fi
 
 echo ""
-echo "✓ 修复完成。下次使用新内核启动时将自动生效。"
-echo "  如要验证：sudo systemctl status nvidia-boot-cleanup.service"
+echo "✓ 安装完成。"
+echo ""
+echo "工作原理："
+echo "  合盖 suspend → 创建 /var/lib/nvidia-boot-cleanup/suspend-pending"
+echo "  正常唤醒     → 删除该文件"
+echo "  断电后开机   → flag 存在 → 重载 nvidia_drm + nvidia_modeset → 删除 flag"
+echo ""
+echo "验证："
+echo "  sudo journalctl -b -t nvidia-boot-cleanup"
+echo ""
+echo "模拟下次断电恢复（可选，重启后生效）："
+echo "  sudo touch /var/lib/nvidia-boot-cleanup/suspend-pending"
